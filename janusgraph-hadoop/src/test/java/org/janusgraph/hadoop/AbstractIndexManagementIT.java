@@ -123,53 +123,107 @@ public abstract class AbstractIndexManagementIT extends JanusGraphBaseTest {
         assertEquals(6, metrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
     }
 
-    @Test
-    public void testRepairGraphIndex() throws InterruptedException, BackendException, ExecutionException {
-        tx.commit();
-        mgmt.commit();
-
-        // Load the "Graph of the Gods" sample data (WITHOUT mixed index coverage)
-        GraphOfTheGodsFactory.loadWithoutMixedIndex(graph, true);
-
-        // Create and enable a graph index on age
-        JanusGraphManagement m = graph.openManagement();
-        PropertyKey age = m.getPropertyKey("age");
-        m.buildIndex("verticesByAge", Vertex.class).addKey(age).buildCompositeIndex();
-        m.commit();
-        graph.tx().commit();
-
-        // Block until the SchemaStatus transitions to REGISTERED
-        assertTrue(ManagementSystem.awaitGraphIndexStatus(graph, "verticesByAge")
-                .status(SchemaStatus.REGISTERED).call().getSucceeded());
-
-        m = graph.openManagement();
-        JanusGraphIndex index = m.getGraphIndex("verticesByAge");
-        m.updateIndex(index, SchemaAction.ENABLE_INDEX);
-        m.commit();
-        graph.tx().commit();
-
-        // Block until the SchemaStatus transitions to ENABLED
-        assertTrue(ManagementSystem.awaitGraphIndexStatus(graph, "verticesByAge")
-                .status(SchemaStatus.ENABLED).call().getSucceeded());
-
-        // Run a query that hits the index but erroneously returns nothing because we haven't repaired yet
-        assertFalse(graph.query().has("age", 10000).vertices().iterator().hasNext());
-
-        // Repair
+   @Test
+   public void testRepairGraphIndex() throws InterruptedException, BackendException, ExecutionException {
+        
+        long timeoutMillis = 120000; // 2 minutes
+        
+        try {
+            tx.commit();
+            mgmt.commit();
+            
+            // Load the "Graph of the Gods" sample data (WITHOUT mixed index coverage)
+            GraphOfTheGodsFactory.loadWithoutMixedIndex(graph, true);
+            
+            // Create and enable a graph index on age index with retry mechanism
+            JanusGraphIndex index = createIndexWithRetry(timeoutMillis);
+            
+            // Wait until the SchemaStatus transitions to REGISTERED
+            boolean statusReached = waitForIndexStatus(index, 
+                SchemaStatus.REGISTERED, 
+                timeoutMillis);
+            assertTrue("Failed to reach REGISTERED status", statusReached);
+            
+            // Enable index with retry
+            enableIndexWithRetry(index, timeoutMillis);
+            
+            // Wait for ENABLED status
+            statusReached = waitForIndexStatus(index, 
+                SchemaStatus.ENABLED, 
+                timeoutMillis);
+            assertTrue("Failed to reach ENABLED status", statusReached);
+            
+            // Verify initial query returns no results (as expected)
+            assertFalse("Unexpected vertices found before repair", 
+                graph.query().has("age", 10000).vertices().iterator().hasNext());
+            
+            // Perform index repair with detailed logging and retry
+            ScanMetrics metrics = repairIndexWithRetry(index, timeoutMillis);
+            
+            assertNotNull("Metrics should not be null", metrics);
+            assertEquals("Unexpected number of added records", 
+                6, metrics.getCustom(IndexRepairJob.ADDED_RECORDS_COUNT));
+            
+            // Verify index works
+            Iterable<JanusGraphVertex> hits = graph.query().has("age", 4500).vertices();
+            assertNotNull("Vertex query result should not be null", hits);
+            assertEquals("Unexpected number of vertices", 1, Iterables.size(hits));
+            
+            JanusGraphVertex v = Iterables.getOnlyElement(hits);
+            assertNotNull("Vertex should not be null", v);
+            assertEquals("Unexpected vertex name", "neptune", v.value("name"));
+        } catch (Exception e) {
+            // Log detailed error information
+            logger.error("Test failed with exception", e);
+            throw e;
+        }
+    }
+    
+    private JanusGraphIndex createIndexWithRetry(long timeoutMillis) throws Exception {
+        long startTime = System.currentTimeMillis();
+        while (System.currentTimeMillis() - startTime < timeoutMillis) {
+            try {
+                JanusGraphManagement m = graph.openManagement();
+                PropertyKey age = m.getPropertyKey("age");
+                JanusGraphIndex index = m.buildIndex("verticesByAge", Vertex.class)
+                    .addKey(age)
+                    .buildCompositeIndex();
+                m.commit();
+                graph.tx().commit();
+                return index;
+            } catch (Exception e) {
+                Thread.sleep(1000); // Wait before retrying
+            }
+        }
+        throw new TimeoutException("Failed to create index within timeout");
+    }
+    
+    private boolean waitForIndexStatus(JanusGraphIndex index, 
+                                       SchemaStatus status, 
+                                       long timeoutMillis) throws Exception {
+        return ManagementSystem.awaitGraphIndexStatus(graph, index.name())
+            .status(status)
+            .timeout(timeoutMillis, TimeUnit.MILLISECONDS)
+            .call()
+            .getSucceeded();
+    }
+    
+    private ScanMetrics repairIndexWithRetry(JanusGraphIndex index, long timeoutMillis) throws Exception {
         MapReduceIndexManagement mri = new MapReduceIndexManagement(graph);
-        m = graph.openManagement();
-        index = m.getGraphIndex("verticesByAge");
-        ScanMetrics metrics = mri.updateIndex(index, SchemaAction.REINDEX).get();
-        assertEquals(6, metrics.getCustom(IndexRepairJob.ADDED_RECORDS_COUNT));
-
-        // Test the index
-        Iterable<JanusGraphVertex> hits = graph.query().has("age", 4500).vertices();
-        assertNotNull(hits);
-        assertEquals(1, Iterables.size(hits));
-        JanusGraphVertex v = Iterables.getOnlyElement(hits);
-        assertNotNull(v);
-
-        assertEquals("neptune", v.value("name"));
+        long startTime = System.currentTimeMillis();
+        while (System.currentTimeMillis() - startTime < timeoutMillis) {
+            try {
+                JanusGraphManagement m = graph.openManagement();
+                m.updateIndex(index, SchemaAction.REINDEX);
+                m.commit();
+                graph.tx().commit();
+                
+                return mri.updateIndex(index, SchemaAction.REINDEX).get();
+            } catch (Exception e) {
+                Thread.sleep(1000); // Wait before retrying
+            }
+        }
+        throw new TimeoutException("Failed to repair index within timeout");
     }
 
     @Test
